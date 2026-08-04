@@ -1,0 +1,42 @@
+# ---------------------------------------------------------------------------
+# 01-base-structure.ldif
+#   CDP 연동을 위한 기본 디렉터리 구조 (사용자 / 그룹 / 서비스 계정 컨테이너)
+#   적용:
+#     ldapmodify -H ldaps://ldap01.example.com:636 -x \
+#       -D "cn=Directory Manager" -W -a -f ldif/01-base-structure.ldif
+#   dc=example,dc=com 은 실제 서픽스로 치환하십시오.
+# ---------------------------------------------------------------------------
+
+dn: ou=People,dc=example,dc=com
+objectClass: top
+objectClass: organizationalUnit
+ou: People
+description: CDP end user accounts (posixAccount + inetOrgPerson)
+
+dn: ou=Groups,dc=example,dc=com
+objectClass: top
+objectClass: organizationalUnit
+ou: Groups
+description: CDP posix groups (memberUid)
+
+dn: ou=Services,dc=example,dc=com
+objectClass: top
+objectClass: organizationalUnit
+ou: Services
+description: Bind/service accounts used by CDP components
+
+# 기본 사용자 그룹 (ldap.env 의 LDAP_DEFAULT_GROUP 과 일치시킬 것)
+dn: cn=cdpusers,ou=Groups,dc=example,dc=com
+objectClass: top
+objectClass: posixGroup
+cn: cdpusers
+gidNumber: 20000
+description: Default primary group for CDP users
+
+# CDP 관리자 매핑용 그룹 (Cloudera Manager / Ranger 역할 매핑에 사용)
+dn: cn=cdpadmins,ou=Groups,dc=example,dc=com
+objectClass: top
+objectClass: posixGroup
+cn: cdpadmins
+gidNumber: 20001
+description: Cluster administrators (mapped to CM Full Administrator)

@@ -1,0 +1,11 @@
+# 실제 접속 정보 (절대 커밋 금지)
+scripts/ldap.env
+*.pw
+*.pem
+*.key
+*.inf
+!*.inf.example
+
+# 작업 산출물
+*.log
+*.bak
