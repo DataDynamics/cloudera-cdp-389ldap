@@ -836,6 +836,8 @@ Knox 게이트웨이의 JVM 트러스트스토어(`/var/lib/knox/gateway/data/se
 
 ## 11. 검증 절차
 
+### 11.1 전체 흐름 점검
+
 ```bash
 # 1) 계정 생성
 cd scripts && ./ldap-add-user.sh -u testuser -f 테스트 -l 사용자 -G cdpusers --random
@@ -860,9 +862,107 @@ beeline -u "jdbc:hive2://hs2.example.com:10000/default;ssl=true" -n testuser -p 
 ./ldap-delete-user.sh -u testuser -y
 ```
 
+### 11.2 패스워드 검증
+
+특정 계정(`akuser`)의 패스워드가 정상 동작하는지 확인하는 순서입니다.
+`scripts/ldap.env` 를 읽어 변수로 사용합니다.
+
+```bash
+source scripts/ldap.env
+export LDAPTLS_CACERT="$LDAP_TLS_CACERT"
+USER=akuser
+```
+
+#### ① 바인드 확인 — 가장 확실한 방법
+
+```bash
+ldapwhoami -H "$LDAP_URI" -x -D "uid=$USER,$LDAP_USER_BASE" -W; echo "rc=$?"
+# 성공 → dn: uid=akuser,ou=people,dc=example,dc=com  /  rc=0
+
+# 패스워드 만료·유예 횟수까지 확인하려면 password policy 컨트롤 사용
+ldapwhoami -H "$LDAP_URI" -x -D "uid=$USER,$LDAP_USER_BASE" -W -e ppolicy
+```
+
+| 결과 | 의미 | 조치 |
+|---|---|---|
+| `dn: uid=...` (rc=0) | 정상 | — |
+| `Invalid credentials (49)` | 패스워드 불일치 또는 미설정 | ④ 로 저장 여부 확인 후 재설정 |
+| `Invalid credentials (49)` + `Exceed password retry limit` | 로그인 실패 누적 잠금 | `./ldap-change-password.sh -u $USER --unlock` |
+| `Server is unwilling to perform (53)` + `Account inactivated` | `nsAccountLock` 잠금 | `./ldap-delete-user.sh -u $USER --enable` |
+| `Confidentiality required (13)` | 평문 연결에서 패스워드 조작 시도 | [8.6](#86-보안-연결-없이-패스워드를-설정해야-할-때) 참고 |
+
+> 바인드는 되는데 `ldapsearch` 결과가 비어 있는 것은 정상일 수 있습니다.
+> 일반 사용자에게는 읽기 ACI 가 없기 때문이며, **인증 확인은 `ldapwhoami` 로 판단**하십시오.
+
+#### ② 계정 상태 한눈에 보기 (LDAP 서버에서)
+
+```bash
+sudo dsidm cdp -b "dc=example,dc=com" account entry-status "uid=$USER,ou=People,dc=example,dc=com"
+```
+
+```
+Entry State: activated                               ← 정상
+Entry State: directly locked through nsAccountLock    ← 잠김
+```
+
+#### ③ 잠금 · 만료 속성 확인 (관리자 바인드)
+
+```bash
+ldapsearch -LLL -H "$LDAP_URI" -x -D "$LDAP_BIND_DN" -y "$LDAP_BIND_PW_FILE" \
+  -b "uid=$USER,$LDAP_USER_BASE" -s base \
+  nsAccountLock passwordRetryCount accountUnlockTime passwordExpirationTime pwdReset
+```
+
+`dn:` 줄만 나오고 값이 하나도 없으면 정상입니다. 값이 보이면 잠금 또는 만료 상태입니다.
+
+#### ④ 패스워드가 실제로 저장되었는지 확인
+
+```bash
+ldapsearch -LLL -H "$LDAP_URI" -x -D "$LDAP_BIND_DN" -y "$LDAP_BIND_PW_FILE" \
+  -b "uid=$USER,$LDAP_USER_BASE" -s base userPassword \
+  | sed -n 's/^userPassword:: //p' | base64 -d | head -c 16; echo
+```
+
+* `{PBKDF2-SHA512}` 로 시작 → 정상 저장
+* 아무것도 출력되지 않음 → 패스워드 미설정 (계정만 생성된 상태)
+* 해시 문자열이 다시 해싱된 형태 → [8.6 ④](#86-보안-연결-없이-패스워드를-설정해야-할-때) 의 `nsslapd-allow-hashed-passwords` 함정
+
+#### ⑤ 서버 로그로 실패 원인 확인
+
+```bash
+sudo grep -B1 -A2 "$USER" /var/log/dirsrv/slapd-cdp/access | tail -20   # BIND 후 err= 값
+sudo tail -50 /var/log/dirsrv/slapd-cdp/errors
+```
+
+#### ⑥ 클러스터 호스트(SSSD) 및 CDP 컴포넌트
+
+```bash
+id $USER && getent passwd $USER
+sudo sssctl user-checks $USER -s sshd -a auth          # PAM 인증까지 검사
+beeline -u "jdbc:hive2://hs2.example.com:10000/default;ssl=true" -n $USER -p '<패스워드>'
+impala-shell -i coordinator.example.com:21050 --ssl -l -u $USER
+```
+
+#### 패스워드 설정이 거부되는 경우
+
+```
+Constraint violation (19)
+additional info: invalid password syntax - password based off of user entry
+```
+
+389 DS 의 trivial-words 검사는 **패스워드에 계정명(`uid`)·`cn`·`sn`·`mail` 등 엔트리 값이 포함되면 거부**합니다
+(`passwordMinTokenLength` 이상 길이의 토큰이 일치할 때). 예를 들어 `akuser` 계정에 `AkUser#Passw0rd` 는 사용할 수 없으며,
+계정 정보와 무관한 문자열을 사용해야 합니다. 그 밖의 `Constraint violation (19)` 은 길이·복잡도·히스토리 정책 위반입니다.
+
+```bash
+sudo dsconf cdp config get passwordMinLength passwordMinDigits passwordMinSpecials \
+  passwordInHistory passwordMinTokenLength
+```
+
 체크리스트
 
 - [ ] `ldapwhoami` 로 LDAPS 바인드 성공
+- [ ] `dsidm account entry-status` 결과가 `activated`, 잠금·만료 속성 없음
 - [ ] 모든 클러스터 호스트에서 `id <사용자>` 성공
 - [ ] Cloudera Manager LDAP 로그인 및 그룹 → 역할 매핑 확인
 - [ ] Ranger Usersync 로 사용자/그룹 동기화 확인
