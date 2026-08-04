@@ -84,8 +84,11 @@ load_config() {
 
   if [[ "$LDAP_URI" != ldaps://* && "$LDAP_URI" != ldapi://* ]]; then
     warn "평문 LDAP(${LDAP_URI}) 로 접속합니다. 패스워드가 네트워크에 노출될 수 있습니다."
-    warn "389 DS 는 패스워드 변경(Password Modify 확장 조작)을 보안 연결에서만 허용하므로"
-    warn "ldaps:// 가 아니면 'Confidentiality required (13)' 오류로 실패합니다."
+    if [[ "${LDAP_PW_METHOD:-extop}" != "modify" ]]; then
+      warn "389 DS 는 패스워드 변경(Password Modify 확장 조작)을 보안 연결에서만 허용하므로"
+      warn "'Confidentiality required (13)' 오류가 발생할 수 있습니다."
+      warn "→ ldaps:// / ldapi:// 사용을 권장하며, 불가피한 경우 --via-modify 옵션을 사용하십시오."
+    fi
   fi
 }
 
@@ -220,8 +223,24 @@ ldap_apply() {
 }
 
 # ldap_set_password <dn> <new-password-file> [old-password-file]
+#   LDAP_PW_METHOD=extop  (기본) ldappasswd — RFC 3062 확장 조작. 보안 연결 필요.
+#   LDAP_PW_METHOD=modify        userPassword 속성을 직접 replace. 평문 연결에서도 동작하지만
+#                                패스워드가 네트워크에 그대로 노출된다.
 ldap_set_password() {
-  local dn=$1 newpw=$2 oldpw=${3:-} out rc=0 args=()
+  local dn=$1 newpw=$2 oldpw=${3:-} out rc=0 args=() pw
+
+  if [[ "${LDAP_PW_METHOD:-extop}" == "modify" ]]; then
+    pw="$(cat "$newpw")"
+    [[ -n "$pw" ]] || { err "패스워드가 비어 있습니다."; return 1; }
+    {
+      printf 'dn: %s\n' "$dn"
+      printf 'changetype: modify\n'
+      printf 'replace: userPassword\n'
+      ldif_attr userPassword "$pw"
+    } | ldap_apply "패스워드 설정 (userPassword modify)"
+    return $?
+  fi
+
   args=( "${LDAP_AUTH_ARGS[@]}" -T "$newpw" )
   [[ -n "$oldpw" ]] && args+=( -t "$oldpw" )
   if [[ "${DRY_RUN:-0}" == "1" ]]; then
@@ -232,6 +251,10 @@ ldap_set_password() {
   if (( rc != 0 )); then
     err "패스워드 설정 실패 (dn=$dn, rc=$rc)"
     printf '%s\n' "$out" >&2
+    if [[ "$out" == *"secure connection"* || "$out" == *"Confidentiality required"* ]]; then
+      err "389 DS 는 Password Modify 확장 조작을 보안 연결에서만 허용합니다."
+      err "ldaps:// 로 접속하거나, LDAPI/STARTTLS 를 사용하거나, --via-modify 옵션을 사용하십시오."
+    fi
     return "$rc"
   fi
   return 0

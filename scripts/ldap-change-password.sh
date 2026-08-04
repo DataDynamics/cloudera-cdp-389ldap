@@ -25,6 +25,9 @@ usage() {
 모드
       --self                  사용자 본인이 현재 패스워드로 인증하여 변경
       --unlock                계정 잠금(nsAccountLock) 및 로그인 실패 잠금 해제만 수행
+      --via-modify            ldappasswd(확장 조작) 대신 userPassword 를 직접 replace.
+                              TLS 없는 ldap:// 연결에서도 동작하지만 패스워드가 평문으로
+                              전송되므로, LDAPS/LDAPI 를 쓸 수 없는 경우에만 사용할 것.
 
 기타
       --dry-run               실제 적용 없이 동작만 출력
@@ -35,10 +38,12 @@ usage() {
   ./ldap-change-password.sh -u hong --random           # 임시 패스워드 발급
   ./ldap-change-password.sh -u hong --self             # 본인이 직접 변경
   ./ldap-change-password.sh -u hong --unlock           # 5회 실패로 잠긴 계정 해제
+  ./ldap-change-password.sh -u hong --via-modify       # TLS 없는 환경(평문 노출 감수)
 EOF
 }
 
 USERNAME=""; PASSWORD=""; PASSWORD_FILE=""; RANDOM_PW=0; SELF=0; UNLOCK=0; DRY_RUN=0
+LDAP_PW_METHOD="extop"
 
 while (( $# > 0 )); do
   case "$1" in
@@ -48,6 +53,7 @@ while (( $# > 0 )); do
     --random)        RANDOM_PW=1; shift ;;
     --self)          SELF=1; shift ;;
     --unlock)        UNLOCK=1; shift ;;
+    --via-modify)    LDAP_PW_METHOD="modify"; shift ;;
     --dry-run)       DRY_RUN=1; shift ;;
     -h|--help)       usage; exit 0 ;;
     *) usage >&2; die "알 수 없는 옵션: $1" ;;
@@ -58,7 +64,7 @@ done
 validate_name "$USERNAME" "계정명"
 (( SELF == 1 && UNLOCK == 1 )) && die "--self 와 --unlock 은 함께 사용할 수 없습니다."
 
-export DRY_RUN
+export DRY_RUN LDAP_PW_METHOD
 require_cmds ldapsearch ldapmodify ldappasswd base64 awk sort
 load_config
 
