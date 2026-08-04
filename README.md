@@ -429,6 +429,7 @@ sudo chmod 600 /etc/dirsrv/.cdpadmin.pw
 | `-G, --groups` | 추가 그룹 CSV (`memberUid` 등록) |
 | `-H/-s` | 홈 디렉터리 / 로그인 셸 |
 | `-p / --password-file / --random` | 패스워드 지정 방식 |
+| `--via-modify` | TLS 없는 연결에서 패스워드 설정 ([8.6](#86-보안-연결-없이-패스워드를-설정해야-할-때)) |
 | `--dry-run` | LDIF 만 출력 |
 
 ### 8.3 사용자 삭제 — `ldap-delete-user.sh`
@@ -462,6 +463,7 @@ sudo chmod 600 /etc/dirsrv/.cdpadmin.pw
 ```
 
 `--self` 모드는 `ldif/03-aci.ldif` 의 "self password change" ACI 가 적용되어 있어야 동작합니다.
+LDAPS 를 쓸 수 없는 환경이라면 [8.6](#86-보안-연결-없이-패스워드를-설정해야-할-때) 의 `--via-modify` 등을 참고하십시오.
 
 ### 8.5 자주 쓰는 조회
 
@@ -480,6 +482,89 @@ ldapsearch -LLL -H "$LDAP_URI" -x -D "$LDAP_BIND_DN" -y "$LDAP_BIND_PW_FILE" \
 # 인증 확인
 ldapwhoami -H "$LDAP_URI" -x -D "uid=hong,$LDAP_USER_BASE" -W
 ```
+
+### 8.6 보안 연결 없이 패스워드를 설정해야 할 때
+
+389 DS 가 보안 연결을 요구하는 것은 **Password Modify 확장 조작(RFC 3062, `ldappasswd`)** 뿐입니다.
+`userPassword` 속성을 직접 수정하는 일반 modify 조작에는 이 제한이 없습니다. 따라서 아래 네 가지 방법이 있습니다.
+
+| 방법 | TLS 필요 | 패스워드 평문 노출 | 패스워드 정책 적용 | 용도 |
+|---|---|---|---|---|
+| ① LDAPI (유닉스 소켓) | 불필요 | 없음(로컬 소켓) | 적용 | **서버 로컬 작업 시 권장** |
+| ② STARTTLS (389 포트) | 인증서 필요 | 없음 | 적용 | 636 포트를 못 여는 경우 |
+| ③ `userPassword` 직접 modify | 불필요 | **있음** | 적용(일반 계정 바인드 시) | TLS 가 아예 없는 환경 |
+| ④ 사전 해시(`pwdhash`) 주입 | 불필요 | 없음 | **미적용** | 자동화/일괄 등록 |
+
+#### ① LDAPI — 서버에 접속해 로컬 소켓으로 처리 (권장)
+
+로컬 유닉스 소켓 연결은 서버가 보안 연결로 취급하므로 TLS 없이도 `ldappasswd` 가 그대로 동작합니다.
+
+```bash
+SOCK="ldapi://%2Frun%2Fslapd-cdp.socket"        # /run/slapd-<인스턴스>.socket, '/' 는 %2F 로 인코딩
+
+# root 자동 바인드(EXTERNAL) — 패스워드 입력조차 필요 없음
+sudo ldappasswd -H "$SOCK" -Y EXTERNAL -s 'NewPassw0rd#2024' "uid=hong,ou=People,dc=example,dc=com"
+
+# 또는 일반 simple 바인드
+sudo ldappasswd -H "$SOCK" -x -D "uid=cdpadmin,ou=Services,dc=example,dc=com" -W \
+  -s 'NewPassw0rd#2024' "uid=hong,ou=People,dc=example,dc=com"
+```
+
+스크립트에서 쓰려면 `ldap.env` 의 URI 만 바꾸면 됩니다(옵션 변경 불필요).
+
+```bash
+LDAP_URI="ldapi://%2Frun%2Fslapd-cdp.socket"
+```
+
+#### ② STARTTLS — 389 포트에서 TLS 협상
+
+```bash
+ldappasswd -H ldap://ldap01.example.com:389 -ZZ -x \
+  -D "uid=cdpadmin,ou=Services,dc=example,dc=com" -W \
+  -s 'NewPassw0rd#2024' "uid=hong,ou=People,dc=example,dc=com"
+```
+
+#### ③ `userPassword` 직접 modify — 스크립트의 `--via-modify`
+
+TLS 가 전혀 구성되지 않은 환경에서 원격으로 처리해야 할 때 사용합니다.
+서버가 `passwordStorageScheme`(PBKDF2-SHA512) 로 해싱해 저장하므로 저장 형태는 `ldappasswd` 와 동일합니다.
+
+```bash
+./ldap-change-password.sh -u hong --via-modify
+./ldap-add-user.sh -u newuser --random --via-modify
+
+# 스크립트 없이 직접 수행할 경우
+printf 'dn: uid=hong,ou=People,dc=example,dc=com\nchangetype: modify\nreplace: userPassword\nuserPassword: NewPassw0rd#2024\n' \
+  | ldapmodify -H ldap://ldap01.example.com:389 -x \
+      -D "uid=cdpadmin,ou=Services,dc=example,dc=com" -W
+```
+
+> * **패스워드가 네트워크에 평문으로 흐릅니다.** 신뢰된 관리 네트워크에서만, 임시 수단으로 사용하십시오.
+> * `cn=Directory Manager` 로 바인드하면 **패스워드 정책이 적용되지 않습니다**
+>   (`passwordMinLength=12` 인 상태에서도 6자 패스워드가 그대로 등록됨). 정책을 적용하려면
+>   `uid=cdpadmin` 같은 일반 관리 계정으로 바인드하십시오. 일반 계정이면
+>   `invalid password syntax - password must be at least 12 characters long` 로 정상 거부됩니다.
+
+#### ④ 사전 해시 주입 — 평문을 네트워크에 흘리지 않기
+
+패스워드를 미리 해싱해서 전송하므로 TLS 없이도 평문이 노출되지 않습니다.
+
+```bash
+# 1) 서버에서 해시 값 주입을 허용 (기본값 off)
+sudo dsconf cdp config replace nsslapd-allow-hashed-passwords=on
+
+# 2) 해시 생성 (인스턴스 설정의 스키마/솔트 사용)
+HASH=$(sudo pwdhash -D /etc/dirsrv/slapd-cdp -s PBKDF2-SHA512 'NewPassw0rd#2024')
+
+# 3) 주입
+printf 'dn: uid=hong,ou=People,dc=example,dc=com\nchangetype: modify\nreplace: userPassword\nuserPassword: %s\n' "$HASH" \
+  | ldapmodify -H ldap://ldap01.example.com:389 -x \
+      -D "uid=cdpadmin,ou=Services,dc=example,dc=com" -W
+```
+
+> * `nsslapd-allow-hashed-passwords` 가 **off 인 상태에서 해시를 넣으면 그 해시 문자열 자체를 평문 패스워드로 간주해
+>   다시 해싱**합니다. 조작은 성공하지만 사용자는 로그인할 수 없게 되므로 반드시 먼저 켜야 합니다.
+> * 사전 해시 값은 **패스워드 정책(길이·복잡도·히스토리)을 우회**합니다. 정책 검증은 스크립트나 발급 절차에서 담당해야 합니다.
 
 ---
 
@@ -834,6 +919,80 @@ sudo logconv.pl /var/log/dirsrv/slapd-cdp/access   # 접근 로그 통계
 | `Confidentiality required (13)` (패스워드 변경 시) | 평문 `ldap://` 연결. 389 DS 는 패스워드 변경에 보안 연결을 요구하므로 `ldaps://` 로 접속 |
 | `Constraint violation (19)` (패스워드 변경 시) | 패스워드 정책(길이/복잡도/히스토리) 위반. `dsconf cdp config get passwordMinLength ...` 로 정책 확인 |
 | `Insufficient access (50)` | ACI 부족. `cdpadmin` 권한(`ldif/03-aci.ldif`) 확인 |
+| 서버 기동 실패 + `No valid configurations can be accessed` | `dse.ldif` 손상/0바이트. [12.4](#124-인스턴스가-기동되지-않을-때--no-valid-configurations-can-be-accessed) 참조 |
+
+### 12.4 인스턴스가 기동되지 않을 때 — `No valid configurations can be accessed`
+
+```
+- INFO  - dse_check_file - The config /etc/dirsrv/slapd-cdp/dse.ldif has zero length. Attempting restore ...
+- ERR   - dse_check_file - The backup file /etc/dirsrv/slapd-cdp/dse.ldif.bak has zero length, refusing to restore it.
+- ERR   - slapd_bootstrap_config - No valid configurations can be accessed! You must restore /etc/dirsrv/slapd-cdp/dse.ldif from backup!
+- EMERG - main - The configuration files in directory /etc/dirsrv/slapd-cdp could not be read or were not found.
+```
+
+설정 파일 `dse.ldif` 가 **없거나 크기가 0** 이고, 폴백 대상인 `dse.ldif.bak` 도 사용할 수 없다는 뜻입니다.
+서버는 0바이트 `dse.ldif` 를 자동으로 삭제하므로, 오류 발생 후에는 파일 자체가 보이지 않을 수 있습니다.
+
+**1) 원인 확인**
+
+```bash
+INST=cdp        # 인스턴스명
+ls -l /etc/dirsrv/slapd-$INST/dse.ldif*      # dse.ldif / .bak / .startOK 크기 확인
+df -h /etc /var/lib/dirsrv                   # 디스크 풀 → 쓰기 중 0바이트로 잘리는 대표 원인
+ls -ld /etc/dirsrv/slapd-$INST               # 소유자 dirsrv:dirsrv, 권한 확인
+tail -50 /var/log/dirsrv/slapd-$INST/errors
+```
+
+| 원인 | 확인 방법 |
+|---|---|
+| 인스턴스명 오타 / 잘못된 경로 | `ls /etc/dirsrv/` 로 실제 `slapd-*` 디렉터리명 확인 |
+| `dscreate` 가 중간에 실패 | 설정 디렉터리는 있는데 `dse.ldif` 가 없음 → 인스턴스 재생성 |
+| 디스크 풀 / 비정상 종료 | `df -h`, `dmesg` 확인 후 공간 확보 |
+| 권한·소유자 변경 | `chown -R dirsrv:dirsrv /etc/dirsrv/slapd-$INST` |
+| SELinux 라벨 손상 | `restorecon -Rv /etc/dirsrv /var/lib/dirsrv` |
+
+**2) 복구 — 최근 정상 기동 시점의 설정으로 되돌리기**
+
+```bash
+sudo systemctl stop dirsrv@$INST 2>/dev/null
+cd /etc/dirsrv/slapd-$INST
+sudo cp -a dse.ldif.startOK dse.ldif      # .bak 이 정상이면 dse.ldif.bak 사용
+sudo chown dirsrv:dirsrv dse.ldif && sudo chmod 600 dse.ldif
+sudo systemctl start dirsrv@$INST
+```
+
+| 파일 | 내용 |
+|---|---|
+| `dse.ldif` | 현재 설정 (서버가 주기적으로 기록) |
+| `dse.ldif.bak` | 직전 설정 백업 |
+| `dse.ldif.startOK` | **마지막으로 정상 기동했을 때의 설정** — 가장 안전한 복구본 |
+
+**3) 복구 후 반드시 확인 — 기동 이후 변경한 설정은 되돌아갑니다**
+
+`dse.ldif.startOK` 는 "마지막 기동 시점"의 스냅샷이므로, 그 뒤 `dsconf` 등으로 변경한
+**백엔드(suffix) 정의, 패스워드 정책, 인덱스, 플러그인 설정이 사라집니다.**
+백엔드 정의가 없어지면 검색이 `No such object (32)` 로 실패하지만,
+**데이터베이스 파일은 그대로 남아 있으므로** 백엔드만 다시 정의하면 데이터가 복구됩니다.
+
+```bash
+# 백엔드가 사라졌는지 확인
+sudo dsconf $INST backend suffix list
+
+# 기존 DB 디렉터리(/var/lib/dirsrv/slapd-$INST/db/userroot)를 그대로 사용해 재정의
+#   → --create-suffix 는 붙이지 말 것 (기존 엔트리를 그대로 인식)
+sudo dsconf $INST backend create --suffix "dc=example,dc=com" --be-name userroot
+
+# 엔트리 복구 확인
+ldapsearch -LLL -H ldaps://ldap01.example.com:636 -x -D "cn=Directory Manager" -W \
+  -b "dc=example,dc=com" "(objectClass=posixAccount)" dn
+
+# 이후 7장의 패스워드 정책 / 인덱스 설정을 다시 적용
+```
+
+`dse.ldif*` 가 모두 손상된 경우에는 [12.1 백업/복구](#121-백업--복구) 의 설정 백업(`/etc/dirsrv/slapd-$INST`)을 복원하거나,
+인스턴스를 재생성한 뒤 LDIF 백업을 `ldif2db` 로 적재하십시오. 이 사고를 막으려면 설정 디렉터리 백업을 **일 단위로 반드시** 수행해야 합니다.
+
+### 12.5 기타 디버깅
 
 ```bash
 # ACI 디버깅 (로그 레벨 128: ACL 처리)
@@ -842,7 +1001,7 @@ sudo tail -f /var/log/dirsrv/slapd-cdp/errors
 sudo dsconf cdp config replace nsslapd-errorlog-level=0     # 확인 후 원복
 ```
 
-### 12.4 이중화 (선택)
+### 12.6 이중화 (선택)
 
 운영 환경에서는 LDAP 단일 장애점을 피하기 위해 2대 이상으로 다중 마스터 복제를 구성하고,
 CDP 쪽에는 `ldaps://ldap01:636 ldaps://ldap02:636` 처럼 두 URL 을 지정하거나 로드밸런서 VIP 를 사용합니다.

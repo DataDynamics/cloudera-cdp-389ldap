@@ -34,6 +34,9 @@ usage() {
   -p, --password <패스워드>   평문 지정 (ps 노출 위험, 테스트 용도로만 사용)
       --password-file <경로>  패스워드 파일에서 읽기
       --random                랜덤 패스워드 생성 후 화면에 출력
+      --via-modify            ldappasswd(확장 조작) 대신 userPassword 를 직접 replace.
+                              TLS 없는 ldap:// 연결에서도 동작하지만 패스워드가 평문으로
+                              전송되므로, LDAPS/LDAPI 를 쓸 수 없는 경우에만 사용할 것.
 
 기타
       --dry-run               실제 적용 없이 수행할 LDIF 만 출력
@@ -48,7 +51,7 @@ EOF
 # ── 인자 파싱 ───────────────────────────────────────────────────────────────
 USERNAME=""; CN=""; GIVENNAME=""; SN=""; MAIL=""; HOMEDIR=""; SHELL_PATH=""
 UIDNUMBER=""; PRIMARY_GROUP=""; EXTRA_GROUPS=""; CREATE_GROUP=1
-PASSWORD=""; PASSWORD_FILE=""; RANDOM_PW=0; DRY_RUN=0
+PASSWORD=""; PASSWORD_FILE=""; RANDOM_PW=0; DRY_RUN=0; LDAP_PW_METHOD="extop"
 
 while (( $# > 0 )); do
   case "$1" in
@@ -66,6 +69,7 @@ while (( $# > 0 )); do
     -p|--password)    PASSWORD="${2:?}"; shift 2 ;;
     --password-file)  PASSWORD_FILE="${2:?}"; shift 2 ;;
     --random)         RANDOM_PW=1; shift ;;
+    --via-modify)     LDAP_PW_METHOD="modify"; shift ;;
     --dry-run)        DRY_RUN=1; shift ;;
     -h|--help)        usage; exit 0 ;;
     *) usage >&2; die "알 수 없는 옵션: $1" ;;
@@ -76,7 +80,7 @@ done
 validate_name "$USERNAME" "계정명"
 [[ -n "$UIDNUMBER" && ! "$UIDNUMBER" =~ ^[0-9]+$ ]] && die "uidNumber 는 숫자여야 합니다: $UIDNUMBER"
 
-export DRY_RUN
+export DRY_RUN LDAP_PW_METHOD
 ldap_init
 
 PRIMARY_GROUP="${PRIMARY_GROUP:-$LDAP_DEFAULT_GROUP}"
